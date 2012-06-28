@@ -1,0 +1,392 @@
+diff -rup src/gdb/doc/gdb.texinfo dst/gdb/doc/gdb.texinfo
+--- src/gdb/doc/gdb.texinfo	2012-03-29 03:01:46.000000000 +0530
++++ dst/gdb/doc/gdb.texinfo	2012-04-09 12:30:56.908569020 +0530
+@@ -1396,6 +1396,56 @@ Execute the @code{make} program with the
+ arguments.  This is equivalent to @samp{shell make @var{make-args}}.
+ @end table
+ 
++If you want to process the output of a @value{GDBN} command using some shell
++command or some script, that can be done by using the command @code{pipe}.
++
++@table @code
++@kindex pipe
++@item pipe @var{dlim} @var{gdbcmd} @var{dlim} @var{shellcmd}
++@var{dlim} is a string of arbitrary length, containing no whitespace and no
++leading @samp{-}, acts as a separator between a @value{GDBN} command
++@var{gdbcmd} and a shell command @var{shellcmd}.  The shell command should be
++in compliance with the syntax of the shell.  The @var{dlim} pattern should not
++appear in @var{gdbcomd}, otherwise the parsing will fail; although it may
++appear in @var{shellcmd}.
++
++If exists, the environment variable @code{SHELL} determines in which shell to
++run the shell command.  Otherwise @value{GDBN} uses the default shell
++(@file{/bin/sh} on Unix systems, @file{COMMAND.COM} on MS-DOS, etc.).
++@end table
++
++@smallexample
++(@value{GDBP}) @b{ptype dd_tbl}
++type = struct dd @{
++    int dd_handle;
++    const char *dd_name;
++    int dd_major;
++    int dd_minor;
++    void *dd_code;
++    void *dd_data;
++@} [1024]
++(@value{GDBP}) @b{pipe <br> print dd_tbl <br> sed 's/@}/\n/g' | grep @
++"\.test_dd" | tr ',' '\n'}
++
++  @{dd_handle = 10
++  dd_name = 0x8048538 ".test_dd"
++  dd_major = 100
++  dd_minor = 0
++  dd_code = 0xcc
++  dd_data = 0x80
++@end smallexample
++
++In the above example @samp{<br>} acts as a delimiter.  The output of
++@samp{print dd_tbl} is passed to the shell command @samp{sed 's/@}/\n/g' | @
++grep ".test_dd" | tr ',' '\n'} for processing.  @samp{|} could be one of the
++natural choise of being used as the delimiter.  In the above example we have
++avoided the same for readability purpose.
++
++In the given example the output of @value{GDBN} command @samp{print dd_tbl} is
++huge and not well formated.  The use of shell commands like @command{sed},
++@command{tr} and @command{grep} ease the searching of desired pattern and hence
++ease debugging.
++
+ @node Logging Output
+ @section Logging Output
+ @cindex logging @value{GDBN} output
+diff -rup src/gdb/Makefile.in dst/gdb/Makefile.in
+--- src/gdb/Makefile.in	2012-03-29 03:01:18.000000000 +0530
++++ dst/gdb/Makefile.in	2012-04-09 12:32:32.584569051 +0530
+@@ -718,6 +718,7 @@ SFILES = ada-exp.y ada-lang.c ada-typepr
+ 	objfiles.c osabi.c observer.c osdata.c \
+ 	opencl-lang.c \
+ 	p-exp.y p-lang.c p-typeprint.c p-valprint.c parse.c printcmd.c \
++	pipe.c \
+ 	proc-service.list progspace.c \
+ 	prologue-value.c psymtab.c \
+ 	regcache.c reggroups.c remote.c remote-fileio.c reverse.c \
+@@ -875,6 +876,7 @@ COMMON_OBS = $(DEPFILES) $(CONFIG_OBS) $
+ 	event-loop.o event-top.o inf-loop.o completer.o \
+ 	gdbarch.o arch-utils.o gdbtypes.o osabi.o copying.o \
+ 	memattr.o mem-break.o target.o parse.o language.o buildsym.o \
++	pipe.o \
+ 	findcmd.o \
+ 	std-regs.o \
+ 	signals.o \
+diff -rup src/gdb/NEWS dst/gdb/NEWS
+--- src/gdb/NEWS	2012-04-02 13:02:31.000000000 +0530
++++ dst/gdb/NEWS	2012-04-09 12:31:52.996569176 +0530
+@@ -265,6 +265,9 @@ QProgramSignals:
+   "!" is now an alias of the "shell" command.
+   Note that no space is needed between "!" and SHELL COMMAND.
+ 
++* New command "pipe" has been added to make GDB's command output available to a
++  shell command for processing.
++
+ * Changed commands
+ 
+ watch EXPRESSION mask MASK_VALUE
+diff -rup src/gdb/pipe.c dst/gdb/pipe.c
+--- src/gdb/pipe.c	2012-05-03 21:29:16.704500001 +0530
++++ dst/gdb/pipe.c	2012-04-09 12:46:08.192569079 +0530
+@@ -0,0 +1,241 @@
++/* Everything about pipe command, for GDB.
++
++   Copyright (C) 2012 Free Software Foundation, Inc.
++
++   This file is part of GDB.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++#include "defs.h"
++#include <ctype.h>
++#include "gdb_string.h"
++#include "ui-file.h"
++#include "ui-out.h"
++#include "cli/cli-utils.h"
++#include "gdbcmd.h"
++#include "libiberty.h"
++#include "exceptions.h"
++
++#if defined (__MINGW32__)
++# define DEFAULT_SHELL "cmd.exe"
++# define OPTION_TO_SHELL "/c"
++#else
++# define DEFAULT_SHELL "/bin/sh"
++# define OPTION_TO_SHELL "-c"
++#endif
++
++void _initialize_pipe (void);
++
++/* Structure to encapsulate all entities associated with pipe.  */
++
++struct pipe_obj
++{
++  /* The delimiter to separate out gdb-command and shell-command.  This can be
++     any arbitrary string without containing any whitespace.  There should not
++     be any leading '-' in the delimiter.  */
++  char *dlim;
++
++  /* The gdb-command.  */
++  char *gdb_cmd;
++
++  /* The shell-command.  */
++  char *shell_cmd;
++
++  /* The gdb-side stream pointer to the pipe.  */
++  FILE *handle;
++
++  /* The pex object used to create pipeline between gdb and shell.  */
++  struct pex_obj *pex;
++};
++
++/* Destruct pipe object referenced by ARG.  */
++
++static void
++destruct_pipe (void *arg)
++{
++  struct pipe_obj *pipe = (struct pipe_obj *) arg;
++
++  if (pipe->handle != NULL)
++    fclose (pipe->handle);
++
++  if (pipe->pex != NULL)
++    {
++      int status;
++
++      /* Wait till the process on the other side of the pipe completes its
++	 job before closing its file descriptors.  */
++      pex_get_status (pipe->pex, 1, &status);
++
++      if (!WIFEXITED (status))
++	warning (_("Execution of shell-command `%s' may not be completed: %s."),
++		 pipe->shell_cmd, safe_strerror (status));
++
++      pex_free (pipe->pex);
++    }
++
++  xfree (pipe->dlim);
++  xfree (pipe);
++}
++
++/* Construct a pipe object by parsing argument ARG to the pipe command.  */
++
++static struct pipe_obj *
++construct_pipe (const char *arg)
++{
++  struct pipe_obj *pipe;
++  struct cleanup *cleanup;
++  char *p, *t;
++
++  if (arg == NULL)
++    error (_("No argument is specified."));
++
++  pipe = XCNEW (struct pipe_obj);
++  cleanup = make_cleanup (destruct_pipe, pipe);
++
++  p = xstrdup (arg);
++  pipe->dlim = p;
++
++  if (*pipe->dlim == '-')
++    error (_("Delimiter pattern should not start with `-'."));
++
++  t = skip_to_space (p);
++  p = skip_spaces (t);
++
++  if (*p == '\0')
++    error (_("No gdb-command is specified."));
++
++  *t = '\0';
++  pipe->gdb_cmd = p;
++
++  for (;;)
++    {
++      t = skip_to_space (p);
++
++      if (*t == '\0')
++	error (_("No shell-command is specified."));
++
++      /* Check whether the token separated by whitespace matches with
++	 delimiter.  */ 
++      if (memcmp (p, pipe->dlim, (t - p)) == 0
++	  && pipe->dlim[t - p] == '\0')
++	{
++	  *p = '\0';
++	  pipe->shell_cmd = skip_spaces (t);
++	  break;
++	}
++
++       p = skip_spaces (t);
++    }
++
++  discard_cleanups (cleanup);
++  return pipe;
++}
++
++/* Run execute_command for PIPE and FROM_TTY.  Write output to the pipe, do not
++   display it to the screen.  */
++
++static void
++execute_command_to_pipe (struct pipe_obj *pipe, int from_tty)
++{
++  char *argv[4];
++  struct cleanup *cleanup;
++  struct ui_file *fp;
++  int status;
++  const char *errmsg;
++  volatile struct gdb_exception exception;
++  char *shell;
++
++  if (*pipe->gdb_cmd == '\0')
++    error (_("No gdb-command is specified."));
++
++  /* Figure out what shell the user program is under.  */
++  shell = getenv ("SHELL");
++  if (shell == NULL)
++    shell = DEFAULT_SHELL;
++
++  argv[0] = shell;
++  argv[1] = OPTION_TO_SHELL;
++  argv[2] = pipe->shell_cmd;
++  argv[3] = NULL;
++
++  pipe->pex = pex_init (PEX_USE_PIPES, argv[0], NULL);
++  pipe->handle = pex_input_pipe (pipe->pex, 0);
++
++  if (pipe->handle == NULL)
++    error (_("Failed to create pipe: %s."), safe_strerror (errno));
++
++  errmsg = pex_run (pipe->pex, PEX_LAST, argv[0], argv, NULL, NULL, &status);
++
++  if (errmsg != NULL)
++    error (_("Failed to execute shell-command `%s' on pipe: %s: %s."),
++	   pipe->shell_cmd, errmsg, safe_strerror (status));
++
++  /* GDB_STDOUT should be better already restored during these
++     restoration callbacks.  */
++  cleanup = set_batch_flag_and_make_cleanup_restore_page_info ();
++  fp = stdio_fileopen (pipe->handle);
++  make_cleanup_ui_file_delete (fp);
++  make_cleanup_restore_ui_file (&gdb_stdout);
++  make_cleanup_restore_ui_file (&gdb_stderr);
++  make_cleanup_restore_ui_file (&gdb_stdlog);
++  make_cleanup_restore_ui_file (&gdb_stdtarg);
++  make_cleanup_restore_ui_file (&gdb_stdtargerr);
++
++  if (ui_out_redirect (current_uiout, fp) < 0)
++    warning (_("Current output protocol does not support redirection."));
++  else 
++    make_cleanup_ui_out_redirect_pop (current_uiout);
++
++  gdb_stdout = fp;
++  gdb_stderr = fp;
++  gdb_stdlog = fp;
++  gdb_stdtarg = fp;
++  gdb_stdtargerr = fp;
++
++  TRY_CATCH (exception, RETURN_MASK_ERROR)
++    {
++      execute_command (pipe->gdb_cmd, from_tty);
++    }
++
++  if (exception.reason < 0)
++    exception_print (gdb_stderr, exception);
++
++  do_cleanups (cleanup);
++}
++
++/* Execute the pipe command with argument ARG and FROM_TTY.  */
++
++static void
++pipe_command (char *arg, int from_tty)
++{
++  struct pipe_obj *pipe = construct_pipe (arg);
++  struct cleanup *cleanup = make_cleanup (destruct_pipe, pipe);
++
++  execute_command_to_pipe (pipe, from_tty);
++  do_cleanups (cleanup);
++}
++
++/* Module initialization.  */
++
++void
++_initialize_pipe (void)
++{
++  add_cmd ("pipe", no_class, pipe_command, _("\
++Create pipe to pass gdb-command output to a shell command for processing.\n\
++Arguments are a delimiter, followed by a gdb-command, then the same\n\
++delimiter again and finally a shell-command.\n\n\
++The delimiter can be a string of arbitrary length containing no whitespace\n\
++and should not have any leading `-'."),
++	   &cmdlist);
++}
+diff -rup src/gdb/testsuite/gdb.base/pipe.exp dst/gdb/testsuite/gdb.base/pipe.exp
+--- src/gdb/testsuite/gdb.base/pipe.exp	2012-05-03 21:29:34.400500006 +0530
++++ dst/gdb/testsuite/gdb.base/pipe.exp	2012-04-09 12:29:37.144569067 +0530
+@@ -0,0 +1,51 @@
++# Copyright 2012 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++#
++# test gdb pipe commands
++#
++
++set test "pipe"
++set tempfile ${objdir}/${subdir}/${test}.x
++
++gdb_exit
++gdb_start
++
++gdb_test "pipe" "No argument is specified."
++gdb_test "pipe |" "No gdb-command is specified."
++gdb_test "pipe -x" "Delimiter pattern should not start with `-'."
++gdb_test "pipe | print 'x'" "No shell-command is specified."
++gdb_test "pipe | print 'x' |< cat" "No shell-command is specified."
++gdb_test "pipe |< print 'x' | cat" "No shell-command is specified."
++gdb_test "pipe | print 'x' >| cat" "No shell-command is specified."
++gdb_test "pipe >| print 'x' | cat" "No shell-command is specified."
++gdb_test "pipe | print 'x' | cat" " = 120 'x'"
++gdb_test "pipe | print 'x' | cat | cat" " = 120 'x'"
++
++file delete $tempfile
++gdb_test_no_output "pipe | p 'x' | cat >$tempfile"
++if ![file exists $tempfile] then {
++    perror "$tempfile does not exist."
++    return 0
++} else {
++    set fp [open $tempfile r]
++    set fdata [read $fp]
++    close $fp
++    if ![regexp {^\$[0-9]+ = 120 'x'\n$} $fdata] then {
++	fail $test
++    } else {
++	pass $test
++    }
++}
